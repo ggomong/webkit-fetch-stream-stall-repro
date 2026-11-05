@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fetch() stream stall test</title>
+<style>
+body { font-family: -apple-system, sans-serif; margin: 12px; font-size: 14px; }
+button { font-size: 18px; padding: 12px 24px; }
+table { border-collapse: collapse; margin-top: 12px; width: 100%; }
+td, th { border: 1px solid #999; padding: 3px 5px; text-align: left; font-size: 12px; }
+.bad { background: #ffc9c9; }
+.ok { background: #d3f9d8; }
+#ua, #summary { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h3>fetch() stream stall test</h3>
+<p>Press Start and keep this page in the foreground until it finishes (about 1 minute).</p>
+<button id="start">Start</button>
+<p id="status"></p>
+<p id="ua"></p>
+<p id="summary"></p>
+<table>
+  <thead><tr><th>Scenario</th><th>Run</th><th>Frames before silence</th><th>Result</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<script>
+// The server sends `count` frames about 4 ms apart, stays silent for `tailMs`,
+// then sends one marker frame. Each frame is `size` bytes.
+const count = 10;
+const size = 256;
+const tailMs = 2500;
+const repeats = 5;
+
+// Frames the reader has not received within this window after the first chunk
+// were held back until the marker arrived. It is longer than the most the busy
+// work can delay reading (count * busy = 900 ms) and shorter than the silence.
+const onTimeWindowMs = 1500;
+
+const scenarios = [
+  { name: "A fetch reader, 90 ms work per frame", transport: "fetch", busy: 90 },
+  { name: "B fetch reader, no work", transport: "fetch", busy: 0 },
+  { name: "C XHR progress, 90 ms work per frame", transport: "xhr", busy: 90 },
+];
+
+function burstUrl() {
+  return `/burst?count=${count}&size=${size}&tail=${tailMs}&r=${Math.random()}`;
+}
+
+// Blocks the main thread, standing in for an app processing each message.
+function spin(ms) {
+  const end = performance.now() + ms;
+  while (performance.now() < end) { /* busy */ }
+}
+
+// Calls onChunk(byteLength, msSinceStart) for every chunk the reader delivers.
+async function readWithFetch(onChunk) {
+  const response = await fetch(burstUrl(), { cache: "no-store" });
+  const reader = response.body.getReader();
+  const startedAt = performance.now();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      return;
+    }
+    onChunk(value.length, Math.round(performance.now() - startedAt));
+  }
+}
+
+function readWithXhr(onChunk) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("GET", burstUrl());
+    xhr.overrideMimeType("text/plain; charset=x-user-defined");
+    const startedAt = performance.now();
+    let seen = 0;
+    const take = () => {
+      const loaded = xhr.responseText.length;
+      if (loaded > seen) {
+        const length = loaded - seen;
+        seen = loaded;
+        onChunk(length, Math.round(performance.now() - startedAt));
+      }
+    };
+    xhr.onprogress = take;
+    xhr.onload = () => { take(); resolve(); };
+    xhr.onerror = () => reject(new Error("xhr error"));
+    xhr.send();
+  });
+}
+
+async function runOnce(scenario) {
+  const chunks = [];
+  let firstAt = null;
+  let carry = 0;
+  let onTimeBytes = 0;
+  let totalBytes = 0;
+  const onChunk = (length, at) => {
+    chunks.push(`${at}:${length}`);
+    firstAt ??= at;
+    totalBytes += length;
+    if (at <= firstAt + onTimeWindowMs) {
+      onTimeBytes += length;
+    }
+    if (scenario.busy > 0) {
+      carry += length;
+      const frames = Math.floor(carry / size);
+      carry -= frames * size;
+      spin(frames * scenario.busy);
+    }
+  };
+  await (scenario.transport === "xhr" ? readWithXhr(onChunk) : readWithFetch(onChunk));
+  const onTime = Math.min(count, Math.floor(onTimeBytes / size));
+  return { onTime, held: count - onTime, totalBytes, chunks };
+}
+
+function report(text) {
+  fetch("/report", { method: "POST", body: text, keepalive: true }).catch(() => {});
+}
+
+document.getElementById("start").onclick = async () => {
+  document.getElementById("start").disabled = true;
+  const statusEl = document.getElementById("status");
+  const rows = document.getElementById("rows");
+  const summary = [];
+  const environment = `scheme=${location.protocol} ua=${navigator.userAgent}`;
+  document.getElementById("ua").textContent = environment;
+  report(`START ${environment}`);
+
+  for (const scenario of scenarios) {
+    let stalledRuns = 0;
+    for (let run = 1; run <= repeats; run++) {
+      statusEl.textContent = `Running ${scenario.name} (${run}/${repeats})`;
+      const result = await runOnce(scenario);
+      if (result.held > 0) {
+        stalledRuns++;
+      }
+      const tr = document.createElement("tr");
+      tr.className = result.held > 0 ? "bad" : "ok";
+      for (const text of [scenario.name, run, `${result.onTime}/${count}`, result.held > 0 ? `HELD BACK ${result.held}` : "ok"]) {
+        const td = document.createElement("td");
+        td.textContent = text;
+        tr.appendChild(td);
+      }
+      rows.appendChild(tr);
+      report(`RESULT ${scenario.name} run=${run} onTime=${result.onTime}/${count} total=${result.totalBytes} chunks=${result.chunks.join(",")}`);
+    }
+    summary.push(`${scenario.name}: ${stalledRuns}/${repeats} runs stalled`);
+  }
+  statusEl.textContent = "Done";
+  document.getElementById("summary").textContent = summary.join("\n");
+  report(`DONE ${summary.join(" | ")}`);
+};
+</script>
+</body>
+</html>
